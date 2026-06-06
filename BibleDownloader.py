@@ -4,19 +4,29 @@ import time
 import sqlite3
 import requests
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_URL = "https://www.wordproject.org/"
+MAX_WORKERS = 5  # Thread count optimized to prevent connection drops
 
 # =====================================================================
-# 1. BULLETPROOF DATABASE CONFIGURATION
+# 1. DYNAMIC BULLETPROOF DATABASE CONFIGURATION
 # =====================================================================
-def initialize_database(db_name="bible_factory.db"):
+def initialize_database(language_name):
     """
-    Creates an optimized SQLite database schema built for high-performance indexing.
+    Creates an optimized SQLite database file uniquely named after the language selected.
     Includes ON CONFLICT REPLACE to make the crawler safe to restart or run repeatedly.
     """
-    conn = sqlite3.connect(db_name)
+    # Sanitize language name for filename
+    safe_lang_name = re.sub(r'[^\w\-_]', '_', language_name)
+    db_name = f"bible_{safe_lang_name}.db"
+    
+    conn = sqlite3.connect(db_name, check_same_thread=False)
     cursor = conn.cursor()
+    
+    # SQLite performance optimizations for high-speed multi-threaded writing
+    cursor.execute('PRAGMA synchronous = OFF;')
+    cursor.execute('PRAGMA journal_mode = WAL;')
     
     # Core Verses Table with safety constraints
     cursor.execute('''
@@ -33,7 +43,7 @@ def initialize_database(db_name="bible_factory.db"):
         )
     ''')
     
-    # Chapter-level Media & Navigation Mapping Table with safety constraints
+    # Chapter-level Media Mapping Table
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS chapter_audio (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,32 +57,32 @@ def initialize_database(db_name="bible_factory.db"):
         )
     ''')
     
-    # High-Performance Indexes for instant execution on App / Bot queries
+    # High-Performance Indexes for lightning-fast lookups
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_verses_lookup ON bible_verses (language, book_number, chapter, verse_number);')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_audio_lookup ON chapter_audio (language, book_number, chapter);')
     
     conn.commit()
-    return conn
+    return conn, db_name
 
 # =====================================================================
-# 2. WEB PARSING CORE LOGIC
+# 2. WEB PARSING CORE LOGIC (Thread Safe Red-Letter Proof Extractor)
 # =====================================================================
-def get_soup(url):
+def get_soup(session, url):
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = session.get(url, headers=headers, timeout=15)
         response.encoding = 'utf-8'
         if response.status_code == 200:
             return BeautifulSoup(response.text, 'html.parser')
     except Exception as e:
-        print(f"\n   ⚠️ Connection warning for {url}: {e}")
+        print(f"\n    ⚠️ Connection warning for {url}: {e}")
     return None
 
-def list_languages():
+def list_languages(session):
     print("🔄 Connecting to target servers to parse dynamic language layout...")
-    soup = get_soup(BASE_URL + "index.htm")
+    soup = get_soup(session, BASE_URL + "index.htm")
     if not soup:
         return {}
         
@@ -97,8 +107,8 @@ def list_languages():
             
     return dict(sorted(languages.items()))
 
-def fetch_books(lang_url):
-    soup = get_soup(lang_url)
+def fetch_books(session, lang_url):
+    soup = get_soup(session, lang_url)
     if not soup: return []
         
     books = []
@@ -130,8 +140,8 @@ def fetch_books(lang_url):
             
     return books
 
-def fetch_chapters(book_url):
-    soup = get_soup(book_url)
+def fetch_chapters(session, book_url):
+    soup = get_soup(session, book_url)
     if not soup: return []
         
     chapters = []
@@ -163,8 +173,9 @@ def fetch_chapters(book_url):
             
     return sorted(chapters, key=lambda x: x['num'])
 
-def parse_verses_and_audio(chapter_url):
-    soup = get_soup(chapter_url)
+def parse_verses_and_audio(session, chapter_url):
+    """Clean, code-isolated Hybrid Extractor that handles Red-Letter elements safely."""
+    soup = get_soup(session, chapter_url)
     if not soup: return [], None
         
     audio_url = None
@@ -180,56 +191,86 @@ def parse_verses_and_audio(chapter_url):
         if audio_match: audio_url = audio_match.group(1)
 
     verses = []
-    
-    # Approach 1: Standard 'textBody' layout (Paragraph structure)
     text_body = soup.find('div', id='textBody') or soup.find('div', class_='textBody')
+    
     if text_body:
-        for extra in text_body.find_all(['h3', 'div', 'span.dimver']):
-            extra.decompose()
-        p_tags = text_body.find_all('p')
-        v_idx = 1
-        for p_tag in p_tags:
-            raw_content = p_tag.get_text("|||", strip=True)
-            lines = [line.strip() for line in raw_content.split("|||") if line.strip()]
-            for line in lines:
-                clean_text = re.sub(r'^\d+\s*[፤]?\s*', '', line).strip()
-                match_num = re.match(r'^(\d+)', line)
-                current_v_num = int(match_num.group(1)) if match_num else v_idx
-                verses.append((current_v_num, clean_text))
-                v_idx = current_v_num + 1
-        if verses: return verses, audio_url
+        # 1. Strip out unwanted page layouts or formatting headers completely
+        for element in text_body.find_all(['h3', 'div', 'a']):
+            element.decompose()
 
-    # Approach 2: Direct span class extraction (Fallback for KJV / Oromoo inline structures)
-    verse_spans = soup.find_all('span', class_='verse')
-    if verse_spans:
-        for span in verse_spans:
-            v_str = span.get('id', '').strip() or re.sub(r'[^\d]', '', span.get_text(strip=True))
-            try:
-                v_num = int(v_str)
-            except ValueError:
-                continue
+        # 2. Process ALL spans safely without deleting text inside them
+        for span in text_body.find_all('span'):
+            classes = span.get('class', [])
+            # Convert verse anchor numbers to plain strings
+            if 'verse' in classes:
+                v_num_str = re.sub(r'[^\d]', '', span.get_text())
+                if v_num_str:
+                    span.replace_with(f" {v_num_str} ")
+            else:
+                # CRITICAL PRESERVATION: Strip the red style wrapper tag, leaving text untouched!
+                span.unwrap()
+
+        # 3. Extract pure text strings entirely stripped of underlying HTML structural blocks
+        raw_content = text_body.get_text(" ", strip=True)
+        
+        # 4. Parse strings using numeric anchors
+        items = re.split(r'(\d+)\s*', raw_content)
+        
+        # If text occurs BEFORE the first numeral marker, it belongs to Verse 1
+        if items and not items[0].strip().isdigit() and items[0].strip():
+            clean_v1 = re.sub(r'^[፤፡\s[:punct:]<>]+', '', items[0]).strip()
+            clean_v1 = re.sub(r'^.*?[:punct:]>\s*', '', clean_v1).strip()
+            if clean_v1:
+                verses.append((1, clean_v1))
+        
+        current_num = None
+        for item in items:
+            item = item.strip()
+            if not item: continue
             
-            next_node = span.next_sibling
-            text_pieces = []
-            while next_node:
-                if next_node.name == 'span' and 'verse' in next_node.get('class', []): break
-                if next_node.name != 'br':
-                    text_pieces.append(next_node.get_text() if next_node.name else str(next_node))
-                next_node = next_node.next_sibling
-                
-            v_text = re.sub(r'\s+', ' ', "".join(text_pieces)).strip()
-            if v_text: verses.append((v_num, v_text))
+            if item.isdigit():
+                current_num = int(item)
+            else:
+                clean_text = re.sub(r'^[፤፡\s[:punct:]<>]+', '', item).strip()
+                clean_text = re.sub(r'^.*?[:punct:]>\s*', '', clean_text).strip()
+                if clean_text and current_num is not None:
+                    verses.append((current_num, clean_text))
+                    current_num = None
+
+    # Final protection data cleanup filter
+    unique_verses = {}
+    for v_num, v_text in verses:
+        v_text = re.sub(r'<[^>]+>', '', v_text)
+        v_text = v_text.replace('span class="verse"', '').replace('span', '').strip()
+        
+        if v_text:
+            unique_verses[v_num] = v_text
             
-    return verses, audio_url
+    sorted_verses = sorted([(k, v) for k, v in unique_verses.items()], key=lambda x: x[0])
+    return sorted_verses, audio_url
 
 # =====================================================================
-# 3. EXTRACTION ROUTINE ENGINE
+# 3. WORKER FUNCTION FOR MULTI-THREADING
+# =====================================================================
+def scrape_single_chapter(session, selected_lang, testament, book_num, book_name, chap_num, chap_url):
+    """Worker task executed concurrently by threads."""
+    try:
+        verses, audio_url = parse_verses_and_audio(session, chap_url)
+        return {
+            'status': 'success', 'book_name': book_name, 'chap_num': chap_num,
+            'verses': verses, 'audio_url': audio_url,
+            'meta': (selected_lang, testament, book_num, book_name, chap_num)
+        }
+    except Exception as e:
+        return {'status': 'error', 'url': chap_url, 'error': str(e)}
+
+# =====================================================================
+# 4. EXTRACTION ROUTINE ENGINE (WITH RESUME LOGIC)
 # =====================================================================
 def main():
-    db_conn = initialize_database()
-    cursor = db_conn.cursor()
+    session = requests.Session()
     
-    langs = list_languages()
+    langs = list_languages(session)
     if not langs:
         print("❌ Could not connect to language listing index mapping layout.")
         return
@@ -246,65 +287,114 @@ def main():
             break
         print("⚠️ Choice out of range.")
 
+    # Initialize dynamic database file
+    db_conn, target_db_file = initialize_database(selected_lang)
+    cursor = db_conn.cursor()
+
+    # --- RESUME SYSTEM CHECK ---
+    print("🔍 Inspecting local database cache to calculate bookmark resume points...")
+    cursor.execute('''
+        SELECT book_number, chapter 
+        FROM bible_verses 
+        WHERE language = ? 
+        GROUP BY book_number, chapter
+    ''', (selected_lang,))
+    
+    completed_chapters = {(row[0], row[1]) for row in cursor.fetchall()}
+    if completed_chapters:
+        print(f"✅ Found {len(completed_chapters)} chapters already completed in your database. Skipping those!")
+    else:
+        print("ℹ️ No previous footprint found. Starting a fresh download run.")
+
     print(f"\n🚀 Commencing target initialization download loop for: [{selected_lang}]")
-    books = fetch_books(lang_url)
+    books = fetch_books(session, lang_url)
     if not books:
         print("❌ No index parameters extracted for books inside this target translation.")
+        db_conn.close()
         return
 
-    print(f"📖 Discovered {len(books)} books inside channel directory structure. Scraping chapters...")
+    print(f"📖 Discovered {len(books)} books inside channel directory structure. Mapping chapters...")
     
-    total_chapters_processed = 0
-    start_time = time.time()
+    scraping_tasks = []
+    skipped_count = 0
     
     for b_idx, book in enumerate(books):
         testament = "Old" if 1 <= book['num'] <= 39 else "New"
-        print(f"\n📂 Processing Book [{b_idx+1}/{len(books)}]: {book['name']} ({testament} Testament)")
-        
-        chapters = fetch_chapters(book['url'])
-        if not chapters:
-            print(f"   ⚠️ Skipping {book['name']} - No chapter indices resolved.")
-            continue
-            
+        chapters = fetch_chapters(session, book['url'])
         for chap in chapters:
-            print(f"   ⚡ Scraping Chapter {chap['num']}... ", end="", flush=True)
-            
-            # Fetch data elements
-            verses, audio_url = parse_verses_and_audio(chap['url'])
-            
-            if not verses:
-                print(" [No text data resolved]")
+            if (book['num'], chap['num']) in completed_chapters:
+                skipped_count += 1
                 continue
                 
-            # Insert or Replace Text Rows
+            scraping_tasks.append({
+                'testament': testament, 'book_num': book['num'], 
+                'book_name': book['name'], 'chap_num': chap['num'], 'chap_url': chap['url']
+            })
+
+    if skipped_count > 0:
+        print(f"⏭️ Fast-forwarded past {skipped_count} chapters already archived.")
+
+    total_tasks = len(scraping_tasks)
+    if total_tasks == 0:
+        print("\n🎉 Everything is already fully scraped and up to date!")
+        db_conn.close()
+        return
+
+    print(f"⚡ Queue prepared with {total_tasks} remaining chapters. Launching parallel engine ({MAX_WORKERS} threads)...")
+
+    total_chapters_processed = 0
+    start_time = time.time()
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_chapter = {
+            executor.submit(
+                scrape_single_chapter, session, selected_lang, task['testament'], 
+                task['book_num'], task['book_name'], task['chap_num'], task['chap_url']
+            ): task for task in scraping_tasks
+        }
+        
+        for future in as_completed(future_to_chapter):
+            result = future.result()
+            
+            if result['status'] == 'error':
+                print(f"  ❌ Error fetching data: {result['url']} | Reason: {result['error']}")
+                continue
+                
+            verses = result['verses']
+            audio_url = result['audio_url']
+            selected_lang, testament, book_num, book_name, chap_num = result['meta']
+            
+            if not verses:
+                print(f"   ⚠️ {book_name} Chapter {chap_num}: No text data resolved.")
+                continue
+
+            # Write batch chapter data
             for v_num, v_text in verses:
                 cursor.execute('''
                     INSERT INTO bible_verses (language, testament, book_number, book_name, chapter, verse_number, verse_text)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (selected_lang, testament, book['num'], book['name'], chap['num'], v_num, v_text))
+                ''', (selected_lang, testament, book_num, book_name, chap_num, v_num, v_text))
                 
-            # Insert or Replace Audio Tracking Link Rows
             if audio_url:
                 cursor.execute('''
                     INSERT INTO chapter_audio (language, book_number, chapter, audio_url)
                     VALUES (?, ?, ?, ?)
-                ''', (selected_lang, book['num'], chap['num'], audio_url))
-                
+                ''', (selected_lang, book_num, chap_num, audio_url))
+            
             db_conn.commit()
             total_chapters_processed += 1
-            print(f"Done ({len(verses)} verses saved) ✓")
             
-            # Request throttle pause (Protects your scraping connection from blocking rules)
-            time.sleep(0.4)
+            print(f"📥 Saved: {book_name} Chapter {chap_num} ({len(verses)} verses) [{total_chapters_processed}/{total_tasks}]")
+            time.sleep(0.05)
 
     db_conn.close()
     elapsed = time.time() - start_time
     print("\n" + "="*60)
     print("✨ EXTRACTION COMPLETE ✨")
     print("="*60)
-    print(f"📦 Database Target: {total_chapters_processed} Chapters safely parsed/merged.")
+    print(f"📦 Database Target: {total_chapters_processed} New Chapters safely written.")
     print(f"⏱️ Total Execution Duration: {elapsed/60:.2f} minutes.")
-    print(f"📁 Output File Path: {os.path.abspath('bible_factory.db')}")
+    print(f"📁 Output File Path: {os.path.abspath(target_db_file)}")
     print("="*60)
 
 if __name__ == "__main__":
